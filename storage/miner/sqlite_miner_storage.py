@@ -19,6 +19,8 @@ import sqlite3
 import contextlib
 import bittensor as bt
 import pandas as pd
+from rewards.data_value_calculator import DataValueCalculator
+from common.data_v2 import ScorableDataEntityBucket
 
 
 # Use a timezone aware adapter for timestamp columns.
@@ -125,6 +127,8 @@ class SqliteMinerStorage(MinerStorage):
         self.cached_index_lock = threading.Lock()
         self.cached_index_4 = None
         self.cached_index_updated = dt.datetime.min
+
+        self.value_calculator = DataValueCalculator()  # Use default model
 
     def _create_connection(self):
         # Create the database if it doesn't exist, defaulting to the local directory.
@@ -357,10 +361,7 @@ class SqliteMinerStorage(MinerStorage):
             return data_entities
 
     def refresh_compressed_index(self, time_delta: dt.timedelta):
-        """Refreshes the compressed MinerIndex."""
-        # First check if we already have a fresh enough index, if so return immediately.
-        # Since the GetMinerIndex uses a 30 minute freshness period this should be the default path with the
-        # Refresh thread using a 20 minute freshness period and calling this method every 21 minutes.
+        """Refreshes the compressed MinerIndex with smart scoring for top ranking."""
         with self.cached_index_lock:
             if dt.datetime.now() - self.cached_index_updated <= time_delta:
                 bt.logging.trace(
@@ -372,8 +373,6 @@ class SqliteMinerStorage(MinerStorage):
                     f"Cached index out of {time_delta} freshness period. Refreshing cached index."
                 )
 
-        # Else we take the refresh lock and check again within the lock.
-        # This handles cases where multiple threads are waiting on refresh at the same time.
         with self.cached_index_refresh_lock:
             with self.cached_index_lock:
                 if dt.datetime.now() - self.cached_index_updated <= time_delta:
@@ -386,8 +385,7 @@ class SqliteMinerStorage(MinerStorage):
                 cursor = connection.cursor()
 
                 oldest_time_bucket_id = TimeBucket.from_datetime(
-                    dt.datetime.now()
-                    - dt.timedelta(constants.DATA_ENTITY_BUCKET_AGE_LIMIT_DAYS)
+                    dt.datetime.now() - dt.timedelta(constants.DATA_ENTITY_BUCKET_AGE_LIMIT_DAYS)
                 ).id
 
                 # Get sum of content_size_bytes for all rows grouped by DataEntityBucket.
@@ -400,34 +398,56 @@ class SqliteMinerStorage(MinerStorage):
                             """,
                     [
                         oldest_time_bucket_id,
-                        constants.DATA_ENTITY_BUCKET_COUNT_LIMIT_PER_MINER_INDEX_PROTOCOL_4,
-                    ],  # Always get the max for caching and truncate to each necessary size.
+                        constants.DATA_ENTITY_BUCKET_COUNT_LIMIT_PER_MINER_INDEX_PROTOCOL_4 * 2,  # Get more for scoring
+                    ],
                 )
 
-                buckets_by_source_by_label = defaultdict(dict)
-
+                buckets = []
                 for row in cursor:
-                    # Ensure the miner does not attempt to report more than the max DataEntityBucket size.
                     size = (
                         constants.DATA_ENTITY_BUCKET_SIZE_LIMIT_BYTES
-                        if row["bucketSize"]
-                        >= constants.DATA_ENTITY_BUCKET_SIZE_LIMIT_BYTES
+                        if row["bucketSize"] >= constants.DATA_ENTITY_BUCKET_SIZE_LIMIT_BYTES
                         else row["bucketSize"]
                     )
-
                     label = row["label"] if row["label"] != "NULL" else None
+                    bucket = {
+                        "time_bucket_id": row["timeBucketId"],
+                        "source": DataSource(row["source"]),
+                        "label": label,
+                        "size": size,
+                    }
+                    buckets.append(bucket)
 
-                    bucket = buckets_by_source_by_label[DataSource(row["source"])].get(
+                # Score each bucket using DataValueCalculator
+                now = dt.datetime.now(dt.timezone.utc)
+                current_time_bucket = TimeBucket.from_datetime(now)
+                scored_buckets = []
+                for b in buckets:
+                    scorable_bucket = ScorableDataEntityBucket(
+                        time_bucket_id=b["time_bucket_id"],
+                        source=b["source"],
+                        label=b["label"],
+                        size_bytes=b["size"],
+                        scorable_bytes=b["size"],
+                    )
+                    score = self.value_calculator.get_score_for_data_entity_bucket(scorable_bucket, current_time_bucket)
+                    scored_buckets.append((score, b))
+
+                # Sort by score descending, take top N
+                scored_buckets.sort(reverse=True, key=lambda x: x[0])
+                top_buckets = scored_buckets[:constants.DATA_ENTITY_BUCKET_COUNT_LIMIT_PER_MINER_INDEX_PROTOCOL_4]
+
+                # Build CompressedMinerIndex from top buckets
+                buckets_by_source_by_label = defaultdict(dict)
+                for score, b in top_buckets:
+                    label = b["label"]
+                    bucket = buckets_by_source_by_label[b["source"]].get(
                         label, CompressedEntityBucket(label=label)
                     )
-                    bucket.sizes_bytes.append(size)
-                    bucket.time_bucket_ids.append(row["timeBucketId"])
-                    buckets_by_source_by_label[DataSource(row["source"])][
-                        label
-                    ] = bucket
+                    bucket.sizes_bytes.append(b["size"])
+                    bucket.time_bucket_ids.append(b["time_bucket_id"])
+                    buckets_by_source_by_label[b["source"]][label] = bucket
 
-                # Convert the buckets_by_source_by_label into a list of lists of CompressedEntityBucket and return
-                bt.logging.trace("Creating protocol 4 cached index.")
                 with self.cached_index_lock:
                     self.cached_index_4 = CompressedMinerIndex(
                         sources={
@@ -437,9 +457,48 @@ class SqliteMinerStorage(MinerStorage):
                     )
                     self.cached_index_updated = dt.datetime.now()
                     bt.logging.success(
-                        f"Created cached index of {CompressedMinerIndex.size_bytes(self.cached_index_4)} bytes "
+                        f"[SMART] Created cached index of {CompressedMinerIndex.size_bytes(self.cached_index_4)} bytes "
                         + f"across {CompressedMinerIndex.bucket_count(self.cached_index_4)} buckets."
                     )
+
+    def prune_low_value_data(self, min_score: float = 0.01):
+        """Prune data older than scoring window and buckets with very low score."""
+        with contextlib.closing(self._create_connection()) as connection:
+            cursor = connection.cursor()
+            oldest_time_bucket_id = TimeBucket.from_datetime(
+                dt.datetime.now() - dt.timedelta(constants.DATA_ENTITY_BUCKET_AGE_LIMIT_DAYS)
+            ).id
+            # Find all buckets
+            cursor.execute(
+                """SELECT timeBucketId, source, label, SUM(contentSizeBytes) as bucketSize FROM DataEntity
+                        GROUP BY timeBucketId, source, label
+                        """
+            )
+            now = dt.datetime.now(dt.timezone.utc)
+            current_time_bucket = TimeBucket.from_datetime(now)
+            for row in cursor:
+                # Prune if too old
+                if row["timeBucketId"] < oldest_time_bucket_id:
+                    cursor.execute(
+                        "DELETE FROM DataEntity WHERE timeBucketId = ? AND source = ? AND label IS ?",
+                        [row["timeBucketId"], row["source"], row["label"]],
+                    )
+                    continue
+                # Prune if low score
+                scorable_bucket = ScorableDataEntityBucket(
+                    time_bucket_id=row["timeBucketId"],
+                    source=DataSource(row["source"]),
+                    label=row["label"] if row["label"] != "NULL" else None,
+                    size_bytes=row["bucketSize"],
+                    scorable_bytes=row["bucketSize"],
+                )
+                score = self.value_calculator.get_score_for_data_entity_bucket(scorable_bucket, current_time_bucket)
+                if score < min_score:
+                    cursor.execute(
+                        "DELETE FROM DataEntity WHERE timeBucketId = ? AND source = ? AND label IS ?",
+                        [row["timeBucketId"], row["source"], row["label"]],
+                    )
+            connection.commit()
 
     def list_contents_in_data_entity_buckets(
         self, data_entity_bucket_ids: List[DataEntityBucketId]
