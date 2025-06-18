@@ -52,6 +52,7 @@ from scraping.scraper import ScrapeConfig, ScraperId
 
 from scraping.x.enhanced_apidojo_scraper import EnhancedApiDojoTwitterScraper
 import json
+import os
 
 # Enable logging to the miner TODO move it to some different location
 bt.logging.set_info(True)
@@ -202,6 +203,20 @@ class Miner:
             f"Successfully connected to miner storage: {self.config.neuron.database_name}."
         )
 
+        # Prune low-value data at startup
+        bt.logging.info("Pruning low-value and old data at startup...")
+        self.storage.prune_low_value_data()
+        bt.logging.success("Pruning complete.")
+
+        # Start background thread to prune every 24 hours
+        def periodic_prune():
+            while True:
+                bt.logging.info("Periodic pruning of low-value and old data...")
+                self.storage.prune_low_value_data()
+                bt.logging.success("Periodic pruning complete.")
+                time.sleep(24 * 60 * 60)  # 24 hours
+        threading.Thread(target=periodic_prune, daemon=True).start()
+
         # Configure the ScraperCoordinator
         bt.logging.info(
             f"Loading scraping config from {self.config.neuron.scraping_config_file}."
@@ -221,6 +236,65 @@ class Miner:
         self.request_lock = threading.RLock()
         self.last_cleared_request_limits = dt.datetime.now()
         self.requests_by_type_by_hotkey = defaultdict(lambda: defaultdict(lambda: 0))
+
+        def dynamic_scraping_adaptation():
+            while True:
+                try:
+                    bt.logging.info("[DynamicScraping] Checking for desirability updates...")
+                    desirability_path = os.path.join(os.path.dirname(__file__), '../dynamic_desirability/default.json')
+                    with open(desirability_path, 'r') as f:
+                        desirability = json.load(f)
+                    # Collect top labels by platform (Reddit, X)
+                    reddit_labels = []
+                    x_labels = []
+                    for entry in desirability:
+                        weight = entry.get('weight', 0)
+                        label = entry['params'].get('label')
+                        platform = entry['params'].get('platform')
+                        if weight >= 0.7 and label:
+                            if platform == 'reddit':
+                                reddit_labels.append(label)
+                            elif platform == 'x':
+                                x_labels.append(label)
+                    # Build new config
+                    new_config = {
+                        "scraper_configs": [
+                            {
+                                "scraper_id": "X.apidojo",
+                                "cadence_seconds": 300,
+                                "labels_to_scrape": [
+                                    {
+                                        "label_choices": x_labels,
+                                        "max_data_entities": 150,
+                                        "max_age_hint_minutes": 1440
+                                    }
+                                ]
+                            },
+                            {
+                                "scraper_id": "Reddit.custom",
+                                "cadence_seconds": 300,
+                                "labels_to_scrape": [
+                                    {
+                                        "label_choices": reddit_labels,
+                                        "max_data_entities": 150,
+                                        "max_age_hint_minutes": 1440
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                    config_path = os.path.join(os.path.dirname(__file__), '../scraping/config/scraping_config.json')
+                    with open(config_path, 'w') as f:
+                        json.dump(new_config, f, indent=4)
+                    bt.logging.success(f"[DynamicScraping] Updated scraping config with {len(reddit_labels)} Reddit and {len(x_labels)} X labels.")
+                    # Reload ScraperCoordinator
+                    scraping_config = ConfigReader.load_config(config_path)
+                    self.scraping_coordinator.update_config(scraping_config)
+                    bt.logging.success("[DynamicScraping] ScraperCoordinator reloaded with new config.")
+                except Exception as e:
+                    bt.logging.error(f"[DynamicScraping] Error: {e}")
+                time.sleep(24 * 60 * 60)  # 24 hours
+        threading.Thread(target=dynamic_scraping_adaptation, daemon=True).start()
 
     def refresh_index(self):
         """
