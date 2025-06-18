@@ -2,14 +2,14 @@
 # Copyright © 2023 Data Universe
 
 # Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
-# documentation files (the “Software”), to deal in the Software without restriction, including without limitation
+# documentation files (the "Software"), to deal in the Software without restriction, including without limitation
 # the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software,
 # and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
 
 # The above copyright notice and this permission notice shall be included in all copies or substantial portions of
 # the Software.
 
-# THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
 # THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
 # THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 # OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
@@ -178,6 +178,20 @@ class Miner:
         bt.logging.success(
             f"Successfully connected to miner storage: {self.config.neuron.database_name}."
         )
+
+        # Prune low-value data at startup
+        bt.logging.info("Pruning low-value and old data at startup...")
+        self.storage.prune_low_value_data()
+        bt.logging.success("Pruning complete.")
+
+        # Start background thread to prune every 24 hours
+        def periodic_prune():
+            while True:
+                bt.logging.info("Periodic pruning of low-value and old data...")
+                self.storage.prune_low_value_data()
+                bt.logging.success("Periodic pruning complete.")
+                time.sleep(24 * 60 * 60)  # 24 hours
+        threading.Thread(target=periodic_prune, daemon=True).start()
 
         # Configure the ScraperCoordinator
         bt.logging.info(
