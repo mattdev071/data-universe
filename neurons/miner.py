@@ -2,14 +2,14 @@
 # Copyright © 2023 Data Universe
 
 # Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
-# documentation files (the “Software”), to deal in the Software without restriction, including without limitation
+# documentation files (the "Software"), to deal in the Software without restriction, including without limitation
 # the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software,
 # and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
 
 # The above copyright notice and this permission notice shall be included in all copies or substantial portions of
 # the Software.
 
-# THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
 # THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
 # THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 # OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
@@ -63,6 +63,29 @@ class Miner:
     def __init__(self, config=None):
         self.config = copy.deepcopy(config or create_config(NeuronType.MINER))
         check_config(self.config)
+
+        # Add cache for frequently accessed data
+        self.data_cache = {}
+        self.cache_lock = threading.RLock()
+        self.cache_ttl = dt.timedelta(minutes=5)
+        self.last_cache_cleanup = dt.datetime.now()
+
+        # Add validation metrics
+        self.validation_metrics = {
+            'total_requests': 0,
+            'successful_validations': 0,
+            'failed_validations': 0,
+            'response_times': []
+        }
+        self.metrics_lock = threading.RLock()
+
+        # Add HF dataset quality tracking
+        self.hf_quality_metrics = {
+            'total_samples': 0,
+            'valid_samples': 0,
+            'last_validation_time': None
+        }
+        self.hf_metrics_lock = threading.RLock()
 
         bt.logging(config=self.config, logging_dir=self.config.full_path)
         bt.logging.info(self.config)
@@ -255,27 +278,163 @@ class Miner:
                 time.sleep(300)  # Wait 5 minutes before trying again
 
     def upload_hugging_face(self):
-        """Going to be removed"""
-        if not self.use_uploader:
-            bt.logging.info("HuggingFace Uploader is not enabled.")
-            return
-
-        time_sleep_val = dt.timedelta(minutes=60).total_seconds()
-        time.sleep(time_sleep_val)
-
+        """Optimized HuggingFace dataset upload with quality checks."""
         while not self.should_exit:
             try:
-                unique_id = self.hf_uploader.unique_id  # Assuming this exists in the DualUploader
-                if self.storage.should_upload_hf_data(unique_id):
-                    bt.logging.info("Trying to upload the data into HuggingFace and S3.")
-                    hf_metadata_list = self.hf_uploader.upload_sql_to_huggingface()
-                    if hf_metadata_list:
-                        self.storage.store_hf_dataset_info(hf_metadata_list)
-            except Exception:
-                bt.logging.error(traceback.format_exc())
+                if not self.use_uploader:
+                    bt.logging.info("Uploader is not enabled. Skipping HF upload.")
+                    time.sleep(300)
+                    continue
 
-            time_sleep_val = dt.timedelta(minutes=90).total_seconds()
-            time.sleep(time_sleep_val)
+                # Get current dataset stats
+                current_stats = self.get_hf_quality_stats()
+                
+                # Only upload if quality is good enough or it's been a while
+                should_upload = (
+                    current_stats['quality_score'] >= 90 or  # High quality
+                    current_stats['last_validation'] is None or  # Never validated
+                    (dt.datetime.now() - current_stats['last_validation']) > dt.timedelta(hours=24)  # 24h old
+                )
+
+                if should_upload:
+                    bt.logging.info("Starting HF dataset upload with quality checks...")
+                    
+                    # Perform quality validation before upload
+                    valid_samples = 0
+                    total_samples = 0
+                    
+                    # Get dataset samples
+                    samples = self.storage.get_hf_dataset_samples()
+                    total_samples = len(samples)
+                    
+                    # Validate samples
+                    for sample in samples:
+                        if self.validate_hf_sample(sample):
+                            valid_samples += 1
+                    
+                    # Update quality metrics
+                    self.update_hf_quality_metrics(valid_samples, total_samples)
+                    
+                    # Only upload if quality threshold is met
+                    quality_score = (valid_samples / total_samples) * 100 if total_samples > 0 else 0
+                    if quality_score >= 80:  # 80% quality threshold
+                        bt.logging.info(f"Dataset quality {quality_score:.2f}% meets threshold. Proceeding with upload.")
+                        self.hf_uploader.upload()
+                        bt.logging.success("HF dataset upload completed successfully.")
+                    else:
+                        bt.logging.warning(f"Dataset quality {quality_score:.2f}% below threshold. Skipping upload.")
+                
+                # Sleep for 5 minutes before next check
+                time.sleep(300)
+                
+            except Exception as e:
+                bt.logging.error(f"Error in HF upload: {str(e)}")
+                time.sleep(300)
+
+    def validate_hf_sample(self, sample: dict) -> bool:
+        """Validates a HuggingFace dataset sample."""
+        try:
+            # Basic structure validation
+            if not sample or not isinstance(sample, dict):
+                return False
+                
+            # Required fields check
+            required_fields = ['text', 'metadata']
+            if not all(field in sample for field in required_fields):
+                return False
+                
+            # Content validation
+            if not sample['text'] or len(sample['text']) < 50:  # Minimum length
+                return False
+                
+            # Metadata validation
+            metadata = sample.get('metadata', {})
+            if not metadata.get('source') or not metadata.get('timestamp'):
+                return False
+                
+            # Source-specific validation
+            source = metadata.get('source')
+            if source == 'twitter':
+                return self._validate_twitter_hf_sample(sample)
+            elif source == 'reddit':
+                return self._validate_reddit_hf_sample(sample)
+            elif source == 'youtube':
+                return self._validate_youtube_hf_sample(sample)
+                
+            return True
+            
+        except Exception as e:
+            bt.logging.error(f"Error validating HF sample: {str(e)}")
+            return False
+
+    def _validate_twitter_hf_sample(self, sample: dict) -> bool:
+        """Validates a Twitter HF sample."""
+        try:
+            text = sample.get('text', '')
+            metadata = sample.get('metadata', {})
+            
+            # Check for minimum content
+            if len(text) < 50:
+                return False
+                
+            # Check for required metadata
+            if not metadata.get('author_id') or not metadata.get('created_at'):
+                return False
+                
+            # Check for engagement metrics
+            if not any(key in metadata for key in ['retweet_count', 'like_count', 'reply_count']):
+                return False
+                
+            return True
+            
+        except Exception:
+            return False
+
+    def _validate_reddit_hf_sample(self, sample: dict) -> bool:
+        """Validates a Reddit HF sample."""
+        try:
+            text = sample.get('text', '')
+            metadata = sample.get('metadata', {})
+            
+            # Check for minimum content
+            if len(text) < 100:
+                return False
+                
+            # Check for required metadata
+            if not metadata.get('subreddit') or not metadata.get('author') or not metadata.get('created_utc'):
+                return False
+                
+            # Check for engagement metrics
+            if not any(key in metadata for key in ['score', 'num_comments', 'upvote_ratio']):
+                return False
+                
+            return True
+            
+        except Exception:
+            return False
+
+    def _validate_youtube_hf_sample(self, sample: dict) -> bool:
+        """Validates a YouTube HF sample."""
+        try:
+            text = sample.get('text', '')
+            metadata = sample.get('metadata', {})
+            
+            # Check for minimum content
+            if len(text) < 200:
+                return False
+                
+            # Check for required metadata
+            if not metadata.get('video_id') or not metadata.get('channel_id') or not metadata.get('published_at'):
+                return False
+                
+            # Check for engagement metrics
+            if not any(key in metadata for key in ['view_count', 'like_count', 'comment_count']):
+                return False
+                
+            return True
+            
+        except Exception:
+            return False
 
     def upload_s3_partitioned(self):
         """Upload DD data to S3 in partitioned format"""
@@ -444,7 +603,7 @@ class Miner:
         bt.logging.success("Successfuly resynced the metagraph.")
 
     def _log_status(self, step: int):
-        """Logs a summary of the miner status in the subnet."""
+        """Enhanced status logging with validation metrics."""
         relative_incentive = self.metagraph.I[self.uid].item() / max(self.metagraph.I)
         incentive_and_hk = zip(self.metagraph.I, self.metagraph.hotkeys)
         incentive_and_hk = sorted(incentive_and_hk, key=lambda x: x[0], reverse=True)
@@ -453,6 +612,11 @@ class Miner:
             if hk == self.wallet.hotkey.ss58_address:
                 position = i
                 break
+
+        # Get validation stats
+        validation_stats = self.get_validation_stats()
+        hf_stats = self.get_hf_quality_stats()
+
         log = (
             f"Step:{step} | "
             f"Block:{self.metagraph.block.item()} | "
@@ -460,7 +624,10 @@ class Miner:
             f"Incentive:{self.metagraph.I[self.uid]} | "
             f"Relative Incentive:{relative_incentive} | "
             f"Position:{position} | "
-            f"Emission:{self.metagraph.E[self.uid]}"
+            f"Emission:{self.metagraph.E[self.uid]} | "
+            f"Validation Success:{validation_stats['success_rate']:.2f}% | "
+            f"Avg Response Time:{validation_stats['avg_response_time']:.2f}s | "
+            f"HF Quality:{hf_stats['quality_score']:.2f}%"
         )
         bt.logging.info(log)
 
@@ -500,22 +667,43 @@ class Miner:
     async def get_data_entity_bucket(
         self, synapse: GetDataEntityBucket
     ) -> GetDataEntityBucket:
-        """Runs after the GetDataEntityBucket synapse has been deserialized (i.e. after synapse.data is available)."""
-        bt.logging.info(
-            f"Got to a GetDataEntityBucket request from {synapse.dendrite.hotkey} for Bucket ID: {str(synapse.data_entity_bucket_id)}."
-        )
+        """Optimized data entity bucket retrieval with caching and validation."""
+        start_time = time.time()
+        try:
+            # Check cache first
+            cache_key = f"bucket_{synapse.data_entity_bucket_id}"
+            with self.cache_lock:
+                if cache_key in self.data_cache:
+                    cached_data, timestamp = self.data_cache[cache_key]
+                    if dt.datetime.now() - timestamp <= self.cache_ttl:
+                        synapse.data_entity_bucket = cached_data
+                        self.update_validation_metrics(True, time.time() - start_time)
+                        return synapse
 
-        # List all the data entities that this miner has for the requested DataEntityBucket.
-        synapse.data_entities = self.storage.list_data_entities_in_data_entity_bucket(
-            synapse.data_entity_bucket_id
-        )
-        synapse.version = constants.PROTOCOL_VERSION
+            # If not in cache, get from storage
+            data_entity_bucket = self.storage.list_data_entities_in_data_entity_bucket(
+                synapse.data_entity_bucket_id
+            )
 
-        bt.logging.success(
-            f"Returning Bucket ID: {str(synapse.data_entity_bucket_id)} with {len(synapse.data_entities)} entities to {synapse.dendrite.hotkey}."
-        )
+            # Validate data
+            valid_entities = []
+            for entity in data_entity_bucket:
+                if self.validate_data_entity(entity):
+                    valid_entities.append(entity)
 
-        return synapse
+            # Update cache
+            with self.cache_lock:
+                self.data_cache[cache_key] = (valid_entities, dt.datetime.now())
+
+            synapse.data_entity_bucket = valid_entities
+            self.update_validation_metrics(True, time.time() - start_time)
+            return synapse
+
+        except Exception as e:
+            bt.logging.error(f"Error in get_data_entity_bucket: {str(e)}")
+            self.update_validation_metrics(False, time.time() - start_time)
+            synapse.data_entity_bucket = []
+            return synapse
 
     async def get_huggingface_metadata(self, synapse: GetHuggingFaceMetadata) -> GetHuggingFaceMetadata:
         bt.logging.info(f"Got a GetHuggingFaceMetadata request from {synapse.dendrite.hotkey}.")
@@ -831,6 +1019,136 @@ class Miner:
                 f" Please register the hotkey using `btcli subnets register` before trying again."
             )
             sys.exit(1)
+
+    def validate_data_entity(self, entity: DataEntity) -> bool:
+        """Validates a data entity before storing it."""
+        try:
+            # Basic validation
+            if not entity or not entity.uri or not entity.content:
+                return False
+
+            # Check for duplicates
+            with self.cache_lock:
+                if entity.uri in self.data_cache:
+                    return False
+
+            # Content validation based on source
+            if entity.source == DataSource.X:
+                return self._validate_twitter_data(entity)
+            elif entity.source == DataSource.REDDIT:
+                return self._validate_reddit_data(entity)
+            elif entity.source == DataSource.YOUTUBE:
+                return self._validate_youtube_data(entity)
+
+            return True
+        except Exception as e:
+            bt.logging.error(f"Error validating data entity: {str(e)}")
+            return False
+
+    def _validate_twitter_data(self, entity: DataEntity) -> bool:
+        """Validates Twitter data."""
+        try:
+            # Add Twitter-specific validation
+            if not entity.content.get('text'):
+                return False
+            if len(entity.content['text']) < 10:  # Minimum length check
+                return False
+            return True
+        except Exception:
+            return False
+
+    def _validate_reddit_data(self, entity: DataEntity) -> bool:
+        """Validates Reddit data."""
+        try:
+            # Add Reddit-specific validation
+            if not entity.content.get('title') or not entity.content.get('text'):
+                return False
+            if len(entity.content['text']) < 20:  # Minimum length check
+                return False
+            return True
+        except Exception:
+            return False
+
+    def _validate_youtube_data(self, entity: DataEntity) -> bool:
+        """Validates YouTube data."""
+        try:
+            # Add YouTube-specific validation
+            if not entity.content.get('transcript'):
+                return False
+            if len(entity.content['transcript']) < 50:  # Minimum length check
+                return False
+            return True
+        except Exception:
+            return False
+
+    def update_validation_metrics(self, success: bool, response_time: float):
+        """Updates validation metrics."""
+        with self.metrics_lock:
+            self.validation_metrics['total_requests'] += 1
+            if success:
+                self.validation_metrics['successful_validations'] += 1
+            else:
+                self.validation_metrics['failed_validations'] += 1
+            self.validation_metrics['response_times'].append(response_time)
+            # Keep only last 1000 response times
+            if len(self.validation_metrics['response_times']) > 1000:
+                self.validation_metrics['response_times'].pop(0)
+
+    def get_validation_stats(self) -> dict:
+        """Returns validation statistics."""
+        with self.metrics_lock:
+            total = self.validation_metrics['total_requests']
+            if total == 0:
+                return {
+                    'success_rate': 0,
+                    'avg_response_time': 0,
+                    'total_requests': 0
+                }
+            
+            success_rate = (self.validation_metrics['successful_validations'] / total) * 100
+            avg_response_time = sum(self.validation_metrics['response_times']) / len(self.validation_metrics['response_times'])
+            
+            return {
+                'success_rate': success_rate,
+                'avg_response_time': avg_response_time,
+                'total_requests': total
+            }
+
+    def update_hf_quality_metrics(self, valid_samples: int, total_samples: int):
+        """Updates HuggingFace dataset quality metrics."""
+        with self.hf_metrics_lock:
+            self.hf_quality_metrics['valid_samples'] = valid_samples
+            self.hf_quality_metrics['total_samples'] = total_samples
+            self.hf_quality_metrics['last_validation_time'] = dt.datetime.now()
+
+    def get_hf_quality_stats(self) -> dict:
+        """Returns HuggingFace dataset quality statistics."""
+        with self.hf_metrics_lock:
+            total = self.hf_quality_metrics['total_samples']
+            if total == 0:
+                return {
+                    'quality_score': 0,
+                    'last_validation': None
+                }
+            
+            quality_score = (self.hf_quality_metrics['valid_samples'] / total) * 100
+            return {
+                'quality_score': quality_score,
+                'last_validation': self.hf_quality_metrics['last_validation_time']
+            }
+
+    def cleanup_cache(self):
+        """Cleans up expired cache entries."""
+        with self.cache_lock:
+            current_time = dt.datetime.now()
+            if current_time - self.last_cache_cleanup > dt.timedelta(minutes=30):
+                expired_keys = [
+                    key for key, (_, timestamp) in self.data_cache.items()
+                    if current_time - timestamp > self.cache_ttl
+                ]
+                for key in expired_keys:
+                    del self.data_cache[key]
+                self.last_cache_cleanup = current_time
 
 
 # This is the main function, which runs the miner.
